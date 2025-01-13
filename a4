@@ -1,0 +1,201 @@
+import hashlib
+import logging
+from datetime import datetime
+import ipaddress
+from getpass import getpass
+
+# Importing necessary modules dynamically to avoid missing dependency issues
+try:
+    from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+    from paramiko.ssh_exception import SSHException
+except ModuleNotFoundError as e:
+    print("Required module not found:", e)
+    print("Please install the missing module using 'pip install netmiko paramiko'")
+    raise ImportError("Missing required dependencies. Ensure all modules are installed before running the script.")
+
+# Basic validation functions
+def validate_ip(ip):
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+def validate_credentials(username, password):
+    stored_hash = hashlib.sha256("123".encode()).hexdigest()
+    input_hash = hashlib.sha256(password.encode()).hexdigest()
+    return username == "MK" and input_hash == stored_hash
+
+def backup_config(conn, hostname):
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"backup_{hostname}_{timestamp}.txt"
+        cfg = conn.send_command('show run')
+        with open(filename, 'w') as f:
+            f.write(cfg)
+        logging.info(f"Configuration backed up to {filename}")
+        return True
+    except Exception as e:
+        logging.error(f"Backup failed: {e}")
+        return False
+
+def verify_ipsec_status(conn):
+    try:
+        isakmp_sa = conn.send_command('show crypto isakmp sa')
+        ipsec_sa = conn.send_command('show crypto ipsec sa')
+
+        logging.info("ISAKMP SA Status:\n" + isakmp_sa)
+        logging.info("IPSec SA Status:\n" + ipsec_sa)
+
+        if 'QM_IDLE' in isakmp_sa and 'encaps:' in ipsec_sa:
+            print("IPSec tunnel is active.")
+        else:
+            print("IPSec tunnel is not established. Check the logs for details.")
+
+        return True
+    except Exception as e:
+        logging.error(f"Failed to verify IPSec status: {e}")
+        return False
+
+def configure_enhanced_acls(conn):
+    acl_commands = [
+        'ip access-list extended INBOUND_ACL',
+        'permit tcp any any established',
+        'permit tcp any host 192.168.1.100 eq 80',
+        'permit tcp any host 192.168.1.100 eq 443',
+        'permit tcp any host 192.168.1.200 eq 22',
+        'permit udp any host 192.168.1.53 eq 53',
+        'permit icmp any any echo-reply',
+        'permit icmp any any time-exceeded',
+        'permit icmp any any unreachable',
+        'deny ip any any log',
+        'ip access-list extended OUTBOUND_ACL',
+        'permit tcp any any eq 80',
+        'permit tcp any any eq 443',
+        'permit udp any any eq 53',
+        'permit icmp any any echo',
+        'deny ip any any log',
+        'interface GigabitEthernet0/0',
+        'ip access-group INBOUND_ACL in',
+        'ip access-group OUTBOUND_ACL out'
+    ]
+
+    try:
+        hostname = conn.send_command('show run | i hostname').split()[-1]
+        if not backup_config(conn, hostname):
+            return False
+        conn.send_config_set(acl_commands)
+        logging.info("Enhanced ACLs configured successfully")
+        return True
+    except Exception as e:
+        logging.error(f"ACL configuration failed: {e}")
+        return False
+
+def configure_ipsec(conn):
+    ipsec_commands = [
+        'crypto isakmp policy 10',
+        'encryption aes 256',
+        'hash sha',
+        'authentication pre-share',
+        'group 5',
+        'lifetime 3600',
+        'crypto isakmp key StrongKey123! address 0.0.0.0',
+        'crypto ipsec transform-set TSET esp-aes 256 esp-sha-hmac',
+        'mode tunnel',
+        'ip access-list extended CRYPTO_ACL',
+        'permit ip 192.168.1.0 0.0.0.255 192.168.2.0 0.0.0.255',
+        'crypto map CMAP 10 ipsec-isakmp',
+        'set peer 192.168.2.1',
+        'set transform-set TSET',
+        'match address CRYPTO_ACL',
+        'interface GigabitEthernet0/1',
+        'crypto map CMAP'
+    ]
+
+    try:
+        hostname = conn.send_command('show run | i hostname').split()[-1]
+        if not backup_config(conn, hostname):
+            return False
+        conn.send_config_set(ipsec_commands)
+        logging.info("IPSec configured successfully")
+
+        # Verify IPSec status
+        if not verify_ipsec_status(conn):
+            logging.warning("IPSec verification failed after configuration.")
+        return True
+    except Exception as e:
+        logging.error(f"IPSec configuration failed: {e}")
+        return False
+
+def main():
+    logging.basicConfig(
+        filename='network_automation.log',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    username = input("Login: ")
+    password = getpass("Password: ")
+
+    if not validate_credentials(username, password):
+        logging.warning(f"Failed login attempt for user: {username}")
+        print("Authentication failed")
+        return
+
+    ip = input("IP: ")
+    if not validate_ip(ip):
+        logging.error(f"Invalid IP address entered: {ip}")
+        print("Invalid IP address")
+        return
+
+    ssh = {
+        'device_type': 'cisco_ios',
+        'host': ip,
+        'username': 'cisco',
+        'password': 'cisco123!'
+    }
+
+    while True:
+        print("\n1. Configure Enhanced ACLs")
+        print("2. Configure IPSec")
+        print("3. Exit")
+
+        choice = input("Pick: ")
+
+        if choice == '3':
+            logging.info("Session terminated by user")
+            print("Goodbye")
+            break
+
+        try:
+            conn = ConnectHandler(**ssh)
+            logging.info(f"SSH connection established to {ip}")
+
+            if choice == '1':
+                if configure_enhanced_acls(conn):
+                    print("Enhanced ACLs configured successfully")
+            elif choice == '2':
+                if configure_ipsec(conn):
+                    print("IPSec configured successfully")
+            else:
+                print("Invalid choice")
+
+        except NetmikoTimeoutException:
+            logging.error(f"Connection timeout to {ip}")
+            print("Connection timeout")
+        except NetmikoAuthenticationException:
+            logging.error(f"Authentication failed for {ip}")
+            print("Authentication failed")
+        except SSHException:
+            logging.error(f"SSH error occurred with {ip}")
+            print("SSH error occurred")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+            print(f"Error: {e}")
+        finally:
+            if 'conn' in locals() and conn:
+                conn.disconnect()
+                print("Disconnected")
+
+if __name__ == "__main__":
+    main()
